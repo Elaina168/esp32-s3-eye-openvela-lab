@@ -8,7 +8,7 @@
 | 构建工具 | Git 2.34.1、Git LFS 3.0.2、`repo` 2.73、Python 3.10.12、CMake 3.22.1、Ninja 1.10.1、Xtensa GCC 12.2.0 | 已验证 |
 | 板卡版本 | 系统板型 `esp32s3-eye`，USB 标识 `303a:1001`。PCB 丝印版本及照片由组员后续补录 | 待补 |
 | USB 与串口 | VMware USB 直通，Ubuntu 识别 `/dev/ttyACM0`，`dialout` 成员具有读写权限。以 115200 8N1 与真机 NSH 交互 | 已验证 |
-| 课程源码与版本锁定 | `dev-ai-contest-2026` 的三个关键仓库与课程提交一致，见[基线版本记录](../baseline-versions.txt)。完整平台清单待同步验证 | 部分完成 |
+| 课程源码与版本锁定 | `dev-ai-contest-2026` 的三个关键仓库与课程提交一致，见[基线版本记录](../baseline-versions.txt)。逐个核对 Linux 平台 250 个工作树和提交，文本锁定清单与固定 manifest 一致 | 已验证 |
 | 通用模拟器 | 按手册验证 Goldfish ARM64 的编译和命令行启动，保留编译、运行日志 | 待验证 |
 | 真机基线 | 已编译、烧录并校验镜像，真机进入 `NuttShell (NSH)`。原版外设结果见[实验记录](实验记录.md) | 已验证 |
 
