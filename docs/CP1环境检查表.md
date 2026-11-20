@@ -4,12 +4,12 @@
 
 | 检查项 | 实测与证据 | 状态 |
 | --- | --- | --- |
-| 主机与资源 | Ubuntu 22.04 LTS x86_64，VMware 客机，2 vCPU，配置 8 GiB 内存，Linux 报告 7.7 GiB。检查时客机可用磁盘约 419 GiB，Windows D 盘约 252 GiB。课程主手册列出的环境为 Ubuntu 22.04 裸机、至少 16 GB 内存。 | 环境差异已记录 |
+| 主机与资源 | Ubuntu 22.04 LTS x86_64，VMware 客机，真机基线构建时为 2 vCPU，当前虚拟机配置为 6 vCPU、8 GiB 内存，Linux 报告 7.7 GiB。检查时客机可用磁盘约 419 GiB，Windows D 盘约 252 GiB。课程主手册列出的环境为 Ubuntu 22.04 裸机、至少 16 GB 内存。 | 环境差异已记录 |
 | 构建工具 | Git 2.34.1、Git LFS 3.0.2、`repo` 2.73、Python 3.10.12、CMake 3.22.1、Ninja 1.10.1、Xtensa GCC 12.2.0 | 已验证 |
 | 板卡版本 | 系统板型 `esp32s3-eye`，USB 标识 `303a:1001`。PCB 丝印版本及照片由组员后续补录 | 待补 |
 | USB 与串口 | VMware USB 直通，Ubuntu 识别 `/dev/ttyACM0`，`dialout` 成员具有读写权限。以 115200 8N1 与真机 NSH 交互 | 已验证 |
 | 课程源码与版本锁定 | `dev-ai-contest-2026` 的三个关键仓库与课程提交一致，见[基线版本记录](../baseline-versions.txt)。逐个核对 Linux 平台 250 个工作树和提交，文本锁定清单与固定 manifest 一致 | 已验证 |
-| 通用模拟器 | 按手册验证 Goldfish ARM64 的编译和命令行启动，保留编译、运行日志 | 待验证 |
+| 通用模拟器 | Goldfish ARM64 的 CMake/Ninja 配置已完成，编译暂停后保留增量构建产物。续编和命令行启动验证待进行 | 进行中 |
 | 真机基线 | 已编译、烧录并校验镜像，真机进入 `NuttShell (NSH)`。原版外设结果见[实验记录](实验记录.md) | 已验证 |
 
 实验日志、镜像和校验记录保存在本地。真机启动时记录到 ROM SHA-256 比较警告，原版摄像头的取帧阻塞也已记录。
