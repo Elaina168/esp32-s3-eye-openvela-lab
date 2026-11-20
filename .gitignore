@@ -1,0 +1,13 @@
+# 本地证据与生成物
+/raw/
+/board-backup/
+/build/
+/out/
+*.log
+*.bin
+*.elf
+*.vmdk
+*.vmx
+*.vmem
+.env
+.env.*
