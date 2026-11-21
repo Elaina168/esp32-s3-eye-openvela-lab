@@ -1,0 +1,733 @@
+diff --git a/arch/xtensa/src/esp32s3/esp32s3_cam.c b/arch/xtensa/src/esp32s3/esp32s3_cam.c
+index 8c4e9feac63..2629a0f43f6 100644
+--- a/arch/xtensa/src/esp32s3/esp32s3_cam.c
++++ b/arch/xtensa/src/esp32s3/esp32s3_cam.c
+@@ -35,7 +35,6 @@
+ 
+ #include <nuttx/spinlock.h>
+ #include <nuttx/kmalloc.h>
+-#include <nuttx/semaphore.h>
+ #include <nuttx/cache.h>
+ #include <nuttx/wqueue.h>
+ #include <nuttx/video/imgdata.h>
+@@ -75,6 +74,10 @@
+ #define ESP32S3_CAM_DMA_BUFLEN    3840
+ #define ESP32S3_CAM_DMADESC_NUM   56
+ #define ESP32S3_CAM_HALF_BUF_SIZE 15360
++#define ESP32S3_CAM_DMA_ALIGN    64
++#define ESP32S3_CAM_DMA_MARGIN   (3 * ESP32S3_CAM_HALF_BUF_SIZE)
++#define ESP32S3_CAM_DMA_CAPACITY (ESP32S3_CAM_DMADESC_NUM * \
++                                 ESP32S3_CAM_DMA_BUFLEN)
+ 
+ /* VSYNC filter threshold */
+ 
+@@ -88,7 +91,9 @@ struct esp32s3_cam_s
+ {
+   struct imgdata_s data;
+ 
++  bool streaming;
+   bool capturing;
++  bool dma_parked;
+ 
+   int cpuint;
+   uint8_t cpu;
+@@ -100,20 +105,13 @@ struct esp32s3_cam_s
+   uint8_t *v4l2_buf;              /* V4L2 userptr buffer (no overflow) */
+   uint32_t fb_size;               /* Frame size in bytes */
+   uint32_t fb_alloc;              /* DMA buffer allocated size */
+-  uint32_t fb_pos;                /* Current write position */
+   uint8_t vsync_cnt;              /* VSYNC counter for frame sync */
+-  uint32_t dma_received;          /* Bytes received by DMA so far */
+-  int dma_desc_offset;            /* Next DMA descriptor index to load */
+ 
+   imgdata_capture_t cb;
+   void *cb_arg;
+   struct work_s frame_work;
+   struct timeval frame_ts;
+ 
+-  int dma_cpuint;
+-  uint16_t width;
+-  uint16_t height;
+-  uint32_t pixfmt;
+ 
+   spinlock_t lock;
+ };
+@@ -139,6 +137,7 @@ static int esp32s3_cam_start_capture(struct imgdata_s *data,
+                                imgdata_capture_t callback,
+                                void *arg);
+ static int esp32s3_cam_stop_capture(struct imgdata_s *data);
++static void esp32s3_cam_arm_frame(struct esp32s3_cam_s *priv);
+ 
+ /****************************************************************************
+  * Private Data
+@@ -176,17 +175,17 @@ static void esp32s3_cam_setup_dma(struct esp32s3_cam_s *priv)
+   total_desc = (remaining + ESP32S3_CAM_DMA_BUFLEN - 1) /
+                ESP32S3_CAM_DMA_BUFLEN;
+ 
+-  for (i = 0; i < total_desc && i < ESP32S3_CAM_DMADESC_NUM; i++)
++  DEBUGASSERT(total_desc > 0 && total_desc <= ESP32S3_CAM_DMADESC_NUM);
++
++  for (i = 0; i < total_desc; i++)
+     {
+       uint32_t data_len;
+-      uint32_t buf_len;
+ 
+       data_len = remaining > ESP32S3_CAM_DMA_BUFLEN ?
+                  ESP32S3_CAM_DMA_BUFLEN : remaining;
+-      buf_len = (data_len + 63) & ~63;
+ 
+       priv->dmadesc[i].ctrl = ESP32S3_DMA_CTRL_OWN |
+-          (buf_len << ESP32S3_DMA_CTRL_BUFLEN_S);
++          (data_len << ESP32S3_DMA_CTRL_BUFLEN_S);
+       priv->dmadesc[i].pbuf = pbuf;
+ 
+       if (i < total_desc - 1)
+@@ -207,20 +206,68 @@ static void frame_complete_worker(void *arg)
+ {
+   struct esp32s3_cam_s *priv = (struct esp32s3_cam_s *)arg;
+ 
+-  if (priv->cb == NULL || priv->fb == NULL)
++  imgdata_capture_t callback;
++  void *callback_arg;
++  uint8_t *dest;
++  uint32_t received = 0;
++  uint32_t size;
++  irqstate_t flags;
++  bool parked;
++
++  flags = spin_lock_irqsave(&priv->lock);
++  if (!priv->streaming)
+     {
++      spin_unlock_irqrestore(&priv->lock, flags);
+       return;
+     }
+ 
+-  up_invalidate_dcache((uintptr_t)priv->fb,
+-                       (uintptr_t)priv->fb + priv->fb_size);
++  callback = priv->cb;
++  callback_arg = priv->cb_arg;
++  dest = priv->v4l2_buf;
++  size = priv->fb_size;
++  parked = priv->dma_parked;
++  priv->v4l2_buf = NULL;
++  spin_unlock_irqrestore(&priv->lock, flags);
++
++  if (parked)
++    {
++      const struct esp32s3_dmadesc_s *desc;
++
++      for (desc = priv->dmadesc; desc != NULL; desc = desc->next)
++        {
++          uint32_t ctrl = desc->ctrl;
++          if ((ctrl & (ESP32S3_DMA_CTRL_OWN |
++                       ESP32S3_DMA_CTRL_ERREOF)) != 0)
++            {
++              break;
++            }
++
++          received += (ctrl >> ESP32S3_DMA_CTRL_DATALEN_S) &
++                      ESP32S3_DMA_CTRL_DATALEN_V;
++        }
++    }
++
++  if (received >= size)
++    {
++      up_invalidate_dcache((uintptr_t)priv->fb,
++                           (uintptr_t)priv->fb + size);
++      memcpy(dest, priv->fb, size);
++      callback(0, size, &priv->frame_ts, callback_arg);
++    }
++  else
++    {
++      callback(EIO, 0, &priv->frame_ts, callback_arg);
++    }
++
++  /* 回调可能停止流，或用 set_buf 提供下一块缓冲区。 */
+ 
+-  if (priv->v4l2_buf != NULL)
++  flags = spin_lock_irqsave(&priv->lock);
++  if (priv->streaming && priv->v4l2_buf != NULL)
+     {
+-      memcpy(priv->v4l2_buf, priv->fb, priv->fb_size);
++      esp32s3_cam_arm_frame(priv);
+     }
+ 
+-  priv->cb(0, priv->fb_size, &priv->frame_ts, priv->cb_arg);
++  spin_unlock_irqrestore(&priv->lock, flags);
+ }
+ 
+ /****************************************************************************
+@@ -234,6 +281,7 @@ static void frame_complete_worker(void *arg)
+ static int IRAM_ATTR cam_interrupt(int irq, void *context, void *arg)
+ {
+   struct esp32s3_cam_s *priv = (struct esp32s3_cam_s *)arg;
++  irqstate_t flags = spin_lock_irqsave(&priv->lock);
+   uint32_t status = getreg32(LCD_CAM_LC_DMA_INT_ST_REG);
+ 
+   if (status & LCD_CAM_CAM_VSYNC_INT_ST_M)
+@@ -251,13 +299,7 @@ static int IRAM_ATTR cam_interrupt(int irq, void *context, void *arg)
+            * Second VSYNC = end of frame (buffer is complete).
+            */
+ 
+-          if (priv->vsync_cnt == 1)
+-            {
+-              /* Frame capture just started, DMA is now receiving data.
+-               * Nothing to do here — wait for next VSYNC.
+-               */
+-            }
+-          else if (priv->vsync_cnt >= 2 && priv->cb)
++          if (priv->vsync_cnt >= 2)
+             {
+               uint32_t regval;
+ 
+@@ -275,12 +317,14 @@ static int IRAM_ATTR cam_interrupt(int irq, void *context, void *arg)
+ 
+               /* Bounded wait for DMA to park */
+ 
++              priv->dma_parked = false;
+               for (int tries = 1000; tries > 0; tries--)
+                 {
+                   uint32_t regaddr = DMA_IN_LINK_CH0_REG +
+                       priv->dma_channel * GDMA_REG_OFFSET;
+                   if (getreg32(regaddr) & DMA_INLINK_PARK_CH0)
+                     {
++                      priv->dma_parked = true;
+                       break;
+                     }
+                 }
+@@ -301,6 +345,7 @@ static int IRAM_ATTR cam_interrupt(int irq, void *context, void *arg)
+                LCD_CAM_LC_DMA_INT_CLR_REG);
+     }
+ 
++  spin_unlock_irqrestore(&priv->lock, flags);
+   return 0;
+ }
+ 
+@@ -531,15 +576,13 @@ static int esp32s3_cam_init(struct imgdata_s *data)
+ {
+   struct esp32s3_cam_s *priv = (struct esp32s3_cam_s *)data;
+ 
++  priv->streaming = false;
+   priv->capturing = false;
++  priv->v4l2_buf = NULL;
+   priv->cb = NULL;
+   priv->cb_arg = NULL;
+   priv->fb = NULL;
+   priv->fb_size = 0;
+-  priv->fb_pos = 0;
+-  priv->width = 0;
+-  priv->height = 0;
+-  priv->pixfmt = 0;
+ 
+   spin_lock_init(&priv->lock);
+ 
+@@ -563,15 +606,7 @@ static int esp32s3_cam_init(struct imgdata_s *data)
+ static int esp32s3_cam_uninit(struct imgdata_s *data)
+ {
+   struct esp32s3_cam_s *priv = (struct esp32s3_cam_s *)data;
+-  uint32_t regval;
+-
+-  work_cancel_sync(LPWORK, &priv->frame_work);
+-
+-  /* Stop capture */
+-
+-  regval = getreg32(LCD_CAM_CAM_CTRL1_REG);
+-  regval &= ~LCD_CAM_CAM_START_M;
+-  putreg32(regval, LCD_CAM_CAM_CTRL1_REG);
++  esp32s3_cam_stop_capture(data);
+ 
+   /* Disable interrupt */
+ 
+@@ -610,45 +645,58 @@ static int esp32s3_cam_set_buf(struct imgdata_s *data,
+                                uint8_t *addr, uint32_t size)
+ {
+   struct esp32s3_cam_s *priv = (struct esp32s3_cam_s *)data;
++  uint32_t pixels;
+   uint32_t needed_size;
+   uint32_t alloc_size;
++  uint8_t *fb;
++  irqstate_t flags;
+ 
+-  priv->width  = datafmts[IMGDATA_FMT_MAIN].width;
+-  priv->height = datafmts[IMGDATA_FMT_MAIN].height;
+-  priv->pixfmt = datafmts[IMGDATA_FMT_MAIN].pixelformat;
++  int ret;
+ 
+-  if (addr != NULL && size > 0)
++  ret = esp32s3_cam_validate_frame_setting(data, nr_datafmts, datafmts,
++                                           NULL);
++  if (ret < 0 || addr == NULL)
+     {
+-      needed_size = size;
+-      priv->v4l2_buf = addr;
++      return ret < 0 ? ret : -EINVAL;
+     }
+-  else
++
++  pixels = (uint32_t)datafmts[IMGDATA_FMT_MAIN].width *
++           datafmts[IMGDATA_FMT_MAIN].height;
++
++  needed_size = pixels * 2;
++  if (size < needed_size)
+     {
+-      needed_size = priv->width * priv->height * 2;
+-      priv->v4l2_buf = NULL;
++      return -EINVAL;
+     }
+ 
+-  alloc_size = needed_size + ESP32S3_CAM_HALF_BUF_SIZE * 3;
++  alloc_size = (needed_size + ESP32S3_CAM_DMA_MARGIN +
++                ESP32S3_CAM_DMA_ALIGN - 1) &
++               ~(ESP32S3_CAM_DMA_ALIGN - 1);
+ 
+   if (priv->fb == NULL || priv->fb_size != needed_size)
+     {
+-      if (priv->fb != NULL)
++      if (priv->streaming)
+         {
+-          kmm_free(priv->fb);
+-          priv->fb = NULL;
++          return -EBUSY;
+         }
+ 
+-      priv->fb = kmm_memalign(64, alloc_size);
+-      if (!priv->fb)
++      fb = kmm_memalign(ESP32S3_CAM_DMA_ALIGN, alloc_size);
++      if (fb == NULL)
+         {
+           snerr("ERROR: Failed to allocate frame buffer\n");
+           return -ENOMEM;
+         }
+ 
++      kmm_free(priv->fb);
++      priv->fb = fb;
+       priv->fb_size = needed_size;
+       priv->fb_alloc = alloc_size;
+     }
+ 
++  flags = spin_lock_irqsave(&priv->lock);
++  priv->v4l2_buf = addr;
++  spin_unlock_irqrestore(&priv->lock, flags);
++
+   return OK;
+ }
+ 
+@@ -661,21 +709,26 @@ static int esp32s3_cam_validate_frame_setting(struct imgdata_s *data,
+                                imgdata_format_t *datafmts,
+                                imgdata_interval_t *interval)
+ {
+-  if (nr_datafmts < 1 || !datafmts)
++  uint32_t pixels;
++
++  if (nr_datafmts != 1 || datafmts == NULL ||
++      datafmts[IMGDATA_FMT_MAIN].pixelformat != IMGDATA_PIX_FMT_RGB565)
+     {
+       return -EINVAL;
+     }
+ 
+-  /* Pixel format is validated by the sensor driver (imgsensor);
+-   * imgdata only checks that width and height are non-zero.
+-   */
+-
+-  if (datafmts[IMGDATA_FMT_MAIN].width == 0 ||
+-      datafmts[IMGDATA_FMT_MAIN].height == 0)
++  pixels = (uint32_t)datafmts[IMGDATA_FMT_MAIN].width *
++           datafmts[IMGDATA_FMT_MAIN].height;
++  if (pixels == 0)
+     {
+       return -EINVAL;
+     }
+ 
++  if (pixels > (ESP32S3_CAM_DMA_CAPACITY - ESP32S3_CAM_DMA_MARGIN) / 2)
++    {
++      return -E2BIG;
++    }
++
+   return OK;
+ }
+ 
+@@ -691,26 +744,34 @@ static int esp32s3_cam_start_capture(struct imgdata_s *data,
+                                void *arg)
+ {
+   struct esp32s3_cam_s *priv = (struct esp32s3_cam_s *)data;
+-  uint32_t regval;
++  irqstate_t flags = spin_lock_irqsave(&priv->lock);
++  int ret = OK;
+ 
+-  if (priv->capturing)
++  if (priv->streaming)
+     {
+-      return -EBUSY;
++      ret = -EBUSY;
+     }
+-
+-  if (!priv->fb)
++  else if (priv->v4l2_buf == NULL)
+     {
+-      return -EINVAL;
++      ret = -EINVAL;
++    }
++  else
++    {
++      priv->cb = callback;
++      priv->cb_arg = arg;
++      priv->streaming = true;
++      esp32s3_cam_arm_frame(priv);
+     }
+ 
+-  priv->cb = callback;
+-  priv->cb_arg = arg;
+-  priv->fb_pos = 0;
+-  priv->vsync_cnt = 0;
+-  priv->dma_received = 0;
+-  priv->dma_desc_offset = 0;
++  spin_unlock_irqrestore(&priv->lock, flags);
++  return ret;
++}
+ 
+-  memset(priv->fb, 0, priv->fb_alloc);
++static void esp32s3_cam_arm_frame(struct esp32s3_cam_s *priv)
++{
++  uint32_t regval;
++
++  priv->vsync_cnt = 0;
+ 
+   /* Rebuild DMA descriptors (reset OWN bits consumed by prior DMA) */
+ 
+@@ -747,7 +808,9 @@ static int esp32s3_cam_start_capture(struct imgdata_s *data,
+   esp32s3_dma_load(priv->dmadesc, priv->dma_channel, false);
+   esp32s3_dma_enable(priv->dma_channel, false);
+ 
+-  /* cam_update BEFORE cam_start */
++  putreg32(LCD_CAM_CAM_VSYNC_INT_CLR_M, LCD_CAM_LC_DMA_INT_CLR_REG);
++
++  /* 先应用寄存器更新，再启动采集。 */
+ 
+   regval = getreg32(LCD_CAM_CAM_CTRL_REG);
+   regval |= LCD_CAM_CAM_UPDATE_REG_M;
+@@ -764,8 +827,6 @@ static int esp32s3_cam_start_capture(struct imgdata_s *data,
+   up_udelay(10);
+   esp32s3_gpio_matrix_in(CONFIG_ESP32S3_CAM_VSYNC_PIN,
+                          CAM_V_SYNC_IDX, true);
+-
+-  return OK;
+ }
+ 
+ /****************************************************************************
+@@ -775,22 +836,24 @@ static int esp32s3_cam_start_capture(struct imgdata_s *data,
+ static int esp32s3_cam_stop_capture(struct imgdata_s *data)
+ {
+   struct esp32s3_cam_s *priv = (struct esp32s3_cam_s *)data;
+-  uint32_t regval;
+-
+-  regval = getreg32(LCD_CAM_CAM_CTRL1_REG);
+-  regval &= ~LCD_CAM_CAM_START_M;
+-  putreg32(regval, LCD_CAM_CAM_CTRL1_REG);
+-
+-  regval = getreg32(LCD_CAM_CAM_CTRL_REG);
+-  regval |= LCD_CAM_CAM_UPDATE_REG_M;
+-  putreg32(regval, LCD_CAM_CAM_CTRL_REG);
++  irqstate_t flags = spin_lock_irqsave(&priv->lock);
+ 
++  priv->streaming = false;
+   priv->capturing = false;
++  modifyreg32(LCD_CAM_CAM_CTRL1_REG, LCD_CAM_CAM_START_M, 0);
++  modifyreg32(LCD_CAM_CAM_CTRL_REG, 0, LCD_CAM_CAM_UPDATE_REG_M);
++  esp32s3_dma_disable(priv->dma_channel, false);
++  esp32s3_dma_reset_channel(priv->dma_channel, false);
++  putreg32(LCD_CAM_CAM_VSYNC_INT_CLR_M, LCD_CAM_LC_DMA_INT_CLR_REG);
++  spin_unlock_irqrestore(&priv->lock, flags);
+ 
+   work_cancel_sync(LPWORK, &priv->frame_work);
+ 
++  flags = spin_lock_irqsave(&priv->lock);
++  priv->v4l2_buf = NULL;
+   priv->cb = NULL;
+   priv->cb_arg = NULL;
++  spin_unlock_irqrestore(&priv->lock, flags);
+ 
+   return OK;
+ }
+diff --git a/drivers/video/v4l2_cap.c b/drivers/video/v4l2_cap.c
+index 731b0467294..3d74d761d0a 100644
+--- a/drivers/video/v4l2_cap.c
++++ b/drivers/video/v4l2_cap.c
+@@ -201,10 +201,9 @@ get_capture_type_inf(FAR capture_mng_t *cmng, uint8_t type);
+ static enum capture_state_e
+ estimate_next_capture_state(FAR capture_mng_t *cmng,
+                             enum capture_state_cause_e cause);
+-static void change_capture_state(FAR capture_mng_t *cmng,
++static int change_capture_state(FAR capture_mng_t *cmng,
+                                  enum capture_state_e next_state);
+ static bool is_taking_still_picture(FAR capture_mng_t *cmng);
+-static bool is_bufsize_sufficient(FAR capture_mng_t *cmng, uint32_t bufsize);
+ static void cleanup_resources(FAR capture_mng_t *cmng);
+ static bool is_sem_waited(FAR sem_t *sem);
+ static int save_scene_param(FAR capture_mng_t *cmng,
+@@ -820,6 +819,8 @@ static int start_capture(FAR struct capture_mng_s *cmng,
+   imgdata_interval_t di;
+   imgsensor_interval_t si;
+ 
++  int ret;
++
+   ASSERT(fmt && interval && cmng->imgsensor && cmng->imgdata);
+ 
+   get_clipped_format(nr_fmt, fmt, clip, c_fmt);
+@@ -831,15 +832,33 @@ static int start_capture(FAR struct capture_mng_s *cmng,
+   convert_to_imgsensorfmt(&fmt[CAPTURE_FMT_SUB], &sf[IMGSENSOR_FMT_SUB]);
+   convert_to_imgsensorinterval(interval, &si);
+ 
+-  IMGDATA_SET_BUF(cmng->imgdata,
++  ret = IMGDATA_SET_BUF(cmng->imgdata,
+      nr_fmt, df, (FAR uint8_t *)bufaddr, bufsize);
+-  IMGDATA_START_CAPTURE(cmng->imgdata,
++  if (ret < 0)
++    {
++      return ret;
++    }
++
++  ret = IMGDATA_START_CAPTURE(cmng->imgdata,
+      nr_fmt, df, &di, complete_capture, cmng);
+-  IMGSENSOR_START_CAPTURE(cmng->imgsensor,
+-     type == V4L2_BUF_TYPE_VIDEO_CAPTURE ?
+-     IMGSENSOR_STREAM_TYPE_VIDEO : IMGSENSOR_STREAM_TYPE_STILL,
+-     nr_fmt, sf, &si);
+-  return OK;
++  if (ret < 0)
++    {
++      return ret;
++    }
++
++  if (cmng->imgsensor->ops->start_capture != NULL)
++    {
++      ret = IMGSENSOR_START_CAPTURE(cmng->imgsensor,
++         type == V4L2_BUF_TYPE_VIDEO_CAPTURE ?
++         IMGSENSOR_STREAM_TYPE_VIDEO : IMGSENSOR_STREAM_TYPE_STILL,
++         nr_fmt, sf, &si);
++      if (ret < 0)
++        {
++          IMGDATA_STOP_CAPTURE(cmng->imgdata);
++        }
++    }
++
++  return ret;
+ }
+ 
+ static void stop_capture(FAR struct capture_mng_s *cmng,
+@@ -853,11 +872,12 @@ static void stop_capture(FAR struct capture_mng_s *cmng,
+     IMGSENSOR_STREAM_TYPE_VIDEO : IMGSENSOR_STREAM_TYPE_STILL);
+ }
+ 
+-static void change_capture_state(FAR capture_mng_t *cmng,
++static int change_capture_state(FAR capture_mng_t *cmng,
+                                  enum capture_state_e next_state)
+ {
+   enum capture_state_e current_state = cmng->capture_inf.state;
+   enum capture_state_e updated_next_state = next_state;
++  int ret;
+ 
+   if (current_state != CAPTURE_STATE_CAPTURE &&
+       next_state    == CAPTURE_STATE_CAPTURE)
+@@ -867,7 +887,7 @@ static void change_capture_state(FAR capture_mng_t *cmng,
+       if (container != NULL)
+         {
+           cmng->capture_inf.seqnum = 0;
+-          start_capture(cmng,
++          ret = start_capture(cmng,
+                         V4L2_BUF_TYPE_VIDEO_CAPTURE,
+                         cmng->capture_inf.nr_fmt,
+                         cmng->capture_inf.fmt,
+@@ -875,6 +895,10 @@ static void change_capture_state(FAR capture_mng_t *cmng,
+                         &cmng->capture_inf.frame_interval,
+                         container->buf.m.userptr,
+                         container->buf.length);
++          if (ret < 0)
++            {
++              return ret;
++            }
+         }
+       else
+         {
+@@ -888,6 +912,7 @@ static void change_capture_state(FAR capture_mng_t *cmng,
+     }
+ 
+   cmng->capture_inf.state = updated_next_state;
++  return OK;
+ }
+ 
+ static bool is_taking_still_picture(FAR capture_mng_t *cmng)
+@@ -896,13 +921,6 @@ static bool is_taking_still_picture(FAR capture_mng_t *cmng)
+          cmng->still_inf.state == CAPTURE_STATE_CAPTURE;
+ }
+ 
+-static bool is_bufsize_sufficient(FAR capture_mng_t *cmng, uint32_t bufsize)
+-{
+-  /* Depend on format, frame size, and JPEG compression quality */
+-
+-  return true;
+-}
+-
+ static void initialize_frame_setting(FAR struct imgsensor_s *imgsensor,
+                                      FAR uint8_t *nr_fmt,
+                                      FAR video_format_t *fmt,
+@@ -1369,6 +1387,32 @@ static size_t get_bufsize(FAR video_format_t *vf)
+     }
+ }
+ 
++static bool is_bufsize_sufficient(FAR capture_type_inf_t *type_inf,
++                                  FAR struct v4l2_buffer *buf)
++{
++  FAR const video_format_t *fmt = &type_inf->fmt[CAPTURE_FMT_MAIN];
++  FAR struct v4l2_rect *clip = &type_inf->clip;
++  uint32_t width;
++  uint32_t height;
++  uint32_t size;
++
++  if (fmt->pixelformat != V4L2_PIX_FMT_RGB565 &&
++      fmt->pixelformat != V4L2_PIX_FMT_RGB565X)
++    {
++      return true;
++    }
++
++  width = is_clipped(clip) ? clip->width : fmt->width;
++  height = is_clipped(clip) ? clip->height : fmt->height;
++  size = buf->length;
++  if (buf->memory == V4L2_MEMORY_MMAP)
++    {
++      size = get_bufsize(&type_inf->fmt[CAPTURE_FMT_MAIN]);
++    }
++
++  return (uint64_t)width * height * 2 <= size;
++}
++
+ static size_t get_heapsize(FAR capture_type_inf_t *type_inf)
+ {
+   return type_inf->bufinf.container_size *
+@@ -2309,6 +2353,9 @@ static int capture_qbuf(FAR struct file *filep,
+   FAR capture_type_inf_t *type_inf;
+   FAR vbuf_container_t *container;
+   enum capture_state_e next_capture_state;
++  irqstate_t flags;
++  bool resume;
++  int ret = OK;
+ 
+   if (cmng == NULL || buf == NULL)
+     {
+@@ -2321,7 +2368,7 @@ static int capture_qbuf(FAR struct file *filep,
+       return -EINVAL;
+     }
+ 
+-  if (!is_bufsize_sufficient(cmng, buf->length))
++  if (!is_bufsize_sufficient(type_inf, buf))
+     {
+       return -EINVAL;
+     }
+@@ -2342,17 +2389,20 @@ static int capture_qbuf(FAR struct file *filep,
+                                  container->buf.length * buf->index);
+     }
+ 
++  nxmutex_lock(&type_inf->lock_state);
++  flags = spin_lock_irqsave_nopreempt(&cmng->lock);
+   video_framebuff_queue_container(&type_inf->bufinf, container);
++  resume = type_inf->state == CAPTURE_STATE_STREAMON;
++  spin_unlock_irqrestore_nopreempt(&cmng->lock, flags);
+ 
+-  nxmutex_lock(&type_inf->lock_state);
+-  if (type_inf->state == CAPTURE_STATE_STREAMON)
++  if (resume)
+     {
+       if (buf->type == V4L2_BUF_TYPE_VIDEO_CAPTURE)
+         {
+           nxmutex_lock(&cmng->still_inf.lock_state);
+           next_capture_state =
+             estimate_next_capture_state(cmng, CAUSE_CAPTURE_START);
+-          change_capture_state(cmng, next_capture_state);
++          ret = change_capture_state(cmng, next_capture_state);
+           nxmutex_unlock(&cmng->still_inf.lock_state);
+         }
+       else
+@@ -2362,7 +2412,7 @@ static int capture_qbuf(FAR struct file *filep,
+           if (container != NULL)
+             {
+               type_inf->seqnum = 0;
+-              start_capture(cmng,
++              ret = start_capture(cmng,
+                             buf->type,
+                             type_inf->nr_fmt,
+                             type_inf->fmt,
+@@ -2370,13 +2420,16 @@ static int capture_qbuf(FAR struct file *filep,
+                             &type_inf->frame_interval,
+                             container->buf.m.userptr,
+                             container->buf.length);
+-              type_inf->state = CAPTURE_STATE_CAPTURE;
++              if (ret == OK)
++                {
++                  type_inf->state = CAPTURE_STATE_CAPTURE;
++                }
+             }
+         }
+     }
+ 
+   nxmutex_unlock(&type_inf->lock_state);
+-  return OK;
++  return ret;
+ }
+ 
+ static int capture_dqbuf(FAR struct file *filep,
+@@ -2423,8 +2476,12 @@ static int capture_dqbuf(FAR struct file *filep,
+               nxmutex_lock(&cmng->mutex);
+               next_capture_state =
+                 estimate_next_capture_state(cmng, CAUSE_CAPTURE_DQBUF);
+-              change_capture_state(cmng, next_capture_state);
++              int ret = change_capture_state(cmng, next_capture_state);
+               nxmutex_unlock(&cmng->mutex);
++              if (ret < 0)
++                {
++                  return ret;
++                }
+             }
+ 
+           nxsem_wait_uninterruptible(dqbuf_wait_flg);
+@@ -2778,7 +2835,7 @@ static int capture_streamon(FAR struct file *filep,
+     {
+       next_capture_state =
+         estimate_next_capture_state(cmng, CAUSE_CAPTURE_START);
+-      change_capture_state(cmng, next_capture_state);
++      ret = change_capture_state(cmng, next_capture_state);
+     }
+ 
+   nxmutex_unlock(&type_inf->lock_state);
+@@ -2899,7 +2956,7 @@ static int capture_takepict_start(FAR struct file *filep,
+         {
+           /* Start still stream capture */
+ 
+-          start_capture(cmng,
++          ret = start_capture(cmng,
+                         V4L2_BUF_TYPE_STILL_CAPTURE,
+                         cmng->still_inf.nr_fmt,
+                         cmng->still_inf.fmt,
+@@ -2908,7 +2965,10 @@ static int capture_takepict_start(FAR struct file *filep,
+                         container->buf.m.userptr,
+                         container->buf.length);
+ 
+-          cmng->still_inf.state = CAPTURE_STATE_CAPTURE;
++          if (ret == OK)
++            {
++              cmng->still_inf.state = CAPTURE_STATE_CAPTURE;
++            }
+         }
+       else
+         {
+diff --git a/include/nuttx/video/imgdata.h b/include/nuttx/video/imgdata.h
+index 74b8fbef2b2..bc288a635d4 100644
+--- a/include/nuttx/video/imgdata.h
++++ b/include/nuttx/video/imgdata.h
+@@ -58,7 +58,7 @@
+ #define IMGDATA_UNINIT(d) \
+   ((d)->ops->uninit ? (d)->ops->uninit(d) : -ENOTTY)
+ #define IMGDATA_SET_BUF(d, n, f, a, s) \
+-  ((d)->ops->set_buf ? (d)->ops->set_buf(d, n, f, a, s) : NULL)
++  ((d)->ops->set_buf ? (d)->ops->set_buf(d, n, f, a, s) : 0)
+ #define IMGDATA_VALIDATE_FRAME_SETTING(d, n, f, i) \
+   ((d)->ops->validate_frame_setting ? \
+    (d)->ops->validate_frame_setting(d, n, f, i) : -ENOTTY)

@@ -1,0 +1,268 @@
+diff --git a/boards/esp32s3/esp32s3-eye/configs/openvela/defconfig b/boards/esp32s3/esp32s3-eye/configs/openvela/defconfig
+index 4338be7..97e3013 100644
+--- a/boards/esp32s3/esp32s3-eye/configs/openvela/defconfig
++++ b/boards/esp32s3/esp32s3-eye/configs/openvela/defconfig
+@@ -49,9 +49,6 @@ CONFIG_ESP32S3_I2S0_BCLKPIN=41
+ CONFIG_ESP32S3_I2S0_DINPIN=2
+ CONFIG_ESP32S3_I2S0_WSPIN=42
+ CONFIG_ESP32S3_I2S=y
+-CONFIG_ESP32S3_LEDC=y
+-CONFIG_ESP32S3_LEDC_TIM0=y
+-CONFIG_ESP32S3_LEDC_TIM0_CHANNELS=1
+ CONFIG_ESP32S3_POWER_SAVE_NONE=y
+ CONFIG_ESP32S3_RT_TIMER_TASK_STACK_SIZE=4096
+ CONFIG_ESP32S3_SDMMC=y
+diff --git a/boards/esp32s3/esp32s3-eye/src/esp32s3_board_camera.c b/boards/esp32s3/esp32s3-eye/src/esp32s3_board_camera.c
+index f18f80c..c34aa20 100644
+--- a/boards/esp32s3/esp32s3-eye/src/esp32s3_board_camera.c
++++ b/boards/esp32s3/esp32s3-eye/src/esp32s3_board_camera.c
+@@ -22,7 +22,6 @@
+ 
+ #include <nuttx/arch.h>
+ #include <nuttx/i2c/i2c_master.h>
+-#include <nuttx/timers/pwm.h>
+ #include <nuttx/video/imgdata.h>
+ #include <nuttx/video/imgsensor.h>
+ #include <nuttx/video/v4l2_cap.h>
+@@ -32,7 +31,6 @@
+ #include "esp32s3_cam.h"
+ #include "esp32s3_gpio.h"
+ #include "esp32s3_i2c.h"
+-#include "esp32s3_ledc.h"
+ 
+ /****************************************************************************
+  * Pre-processor Definitions
+@@ -44,7 +42,12 @@
+ 
+ #define QVGA_WIDTH 320
+ #define QVGA_HEIGHT 240
+-#define RGB565_BPP 2
++#define OV2640_BANK_SEL 0xff
++#define OV2640_SENSOR_BANK 0x01
++#define OV2640_PID 0x0a
++#define OV2640_VER 0x0b
++#define OV2640_PID_VALUE 0x26
++#define OV2640_VER_VALUE 0x42
+ 
+ /****************************************************************************
+  * Private Types
+@@ -381,29 +384,60 @@ static int ov2640_write_reglist(FAR struct i2c_master_s* i2c,
+  * Private Functions - imgsensor ops (OV2640 sensor control)
+  ****************************************************************************/
+ 
+-static bool ov2640_is_available(FAR struct imgsensor_s* sensor)
++static int ov2640_probe(FAR struct i2c_master_s *i2c)
+ {
+-    return true;
++    const struct i2c_config_s config = {
++        .frequency = OV2640_I2C_FREQ,
++        .address = OV2640_I2C_ADDR,
++        .addrlen = 7,
++    };
++    uint8_t regs[] = {OV2640_PID, OV2640_VER};
++    uint8_t id[2];
++    int ret;
++
++    ret = ov2640_write_reg(i2c, OV2640_BANK_SEL, OV2640_SENSOR_BANK);
++    if (ret < 0) {
++        return ret;
++    }
++
++    for (size_t i = 0; i < sizeof(regs); i++) {
++        ret = i2c_write(i2c, &config, &regs[i], 1);
++        if (ret < 0) {
++            return ret;
++        }
++
++        ret = i2c_read(i2c, &config, &id[i], 1);
++        if (ret < 0) {
++            return ret;
++        }
++    }
++
++    if (id[0] != OV2640_PID_VALUE || id[1] != OV2640_VER_VALUE) {
++        syslog(LOG_ERR, "OV2640: unexpected ID %02x:%02x\n", id[0], id[1]);
++        return -ENODEV;
++    }
++
++    syslog(LOG_INFO, "OV2640: ID %02x:%02x\n", id[0], id[1]);
++    return OK;
+ }
+ 
+-static void ov2640_start_xclk(void)
++static bool ov2640_is_available(FAR struct imgsensor_s* sensor)
+ {
+-    FAR struct pwm_lowerhalf_s *pwm;
+-    struct pwm_info_s info;
++    FAR struct i2c_master_s *i2c;
++    int ret;
+ 
+-    pwm = esp32s3_ledc_init(0);
+-    if (pwm == NULL) {
+-        syslog(LOG_ERR, "CAM: LEDC init failed\n");
+-        return;
++    i2c = esp32s3_i2cbus_initialize(OV2640_I2C_BUS);
++    if (i2c == NULL) {
++        return false;
+     }
+ 
+-    pwm->ops->setup(pwm);
+-
+-    info.frequency = 20000000;
+-    info.duty = (ub16_t)(65536 / 2);
++    ret = ov2640_probe(i2c);
++    esp32s3_i2cbus_uninitialize(i2c);
++    if (ret < 0) {
++        syslog(LOG_ERR, "OV2640: probe failed: %d\n", ret);
++    }
+ 
+-    pwm->ops->start(pwm, &info);
+-    syslog(LOG_INFO, "CAM: LEDC XCLK 20MHz started on GPIO15\n");
++    return ret == OK;
+ }
+ 
+ static int ov2640_init(FAR struct imgsensor_s* sensor)
+@@ -411,20 +445,21 @@ static int ov2640_init(FAR struct imgsensor_s* sensor)
+     FAR struct i2c_master_s* i2c;
+     int ret;
+ 
+-    ov2640_start_xclk();
+-    syslog(LOG_INFO, "CAM: LEDC XCLK started on GPIO15\n");
+-    up_mdelay(50);
+-
+     i2c = esp32s3_i2cbus_initialize(OV2640_I2C_BUS);
+     if (i2c == NULL) {
+         return -ENODEV;
+     }
+ 
++    ret = ov2640_probe(i2c);
++    if (ret < 0) {
++        goto out;
++    }
++
+     /* 1. Soft reset */
+ 
+     ret = WRITE_REGS(i2c, g_ov2640_reset);
+     if (ret < 0) {
+-        return ret;
++        goto out;
+     }
+ 
+     up_mdelay(10);
+@@ -433,35 +468,35 @@ static int ov2640_init(FAR struct imgsensor_s* sensor)
+ 
+     ret = WRITE_REGS(i2c, g_ov2640_cif_base);
+     if (ret < 0) {
+-        return ret;
++        goto out;
+     }
+ 
+     /* 3. CIF mode transition (DSP window + CTRL2/CTRLI) */
+ 
+     ret = WRITE_REGS(i2c, g_ov2640_to_cif);
+     if (ret < 0) {
+-        return ret;
++        goto out;
+     }
+ 
+     /* 4. QVGA zoom window */
+ 
+     ret = WRITE_REGS(i2c, g_ov2640_qvga_window);
+     if (ret < 0) {
+-        return ret;
++        goto out;
+     }
+ 
+     /* 5. Clock config */
+ 
+     ret = WRITE_REGS(i2c, g_ov2640_clock);
+     if (ret < 0) {
+-        return ret;
++        goto out;
+     }
+ 
+     /* 6. Enable DSP */
+ 
+     ret = WRITE_REGS(i2c, g_ov2640_dsp_en);
+     if (ret < 0) {
+-        return ret;
++        goto out;
+     }
+ 
+     up_mdelay(10);
+@@ -470,11 +505,13 @@ static int ov2640_init(FAR struct imgsensor_s* sensor)
+ 
+     ret = WRITE_REGS(i2c, g_ov2640_rgb565);
+     if (ret < 0) {
+-        return ret;
++        goto out;
+     }
+ 
+     syslog(LOG_INFO, "OV2640 sensor configured for QVGA RGB565\n");
+-    return OK;
++out:
++    esp32s3_i2cbus_uninitialize(i2c);
++    return ret < 0 ? ret : OK;
+ }
+ 
+ static int ov2640_uninit(FAR struct imgsensor_s* sensor)
+@@ -494,6 +531,18 @@ static int ov2640_validate(FAR struct imgsensor_s* sensor,
+     FAR imgsensor_format_t* datafmts,
+     FAR imgsensor_interval_t* interval)
+ {
++    if ((type != IMGSENSOR_STREAM_TYPE_VIDEO &&
++         type != IMGSENSOR_STREAM_TYPE_STILL) ||
++        nr_datafmts != 1 || datafmts == NULL || interval == NULL ||
++        datafmts[IMGSENSOR_FMT_MAIN].width != QVGA_WIDTH ||
++        datafmts[IMGSENSOR_FMT_MAIN].height != QVGA_HEIGHT ||
++        datafmts[IMGSENSOR_FMT_MAIN].pixelformat != IMGSENSOR_PIX_FMT_RGB565 ||
++        interval->numerator == 0 ||
++        (uint64_t)interval->numerator * g_frminterval.discrete.denominator !=
++        interval->denominator) {
++        return -EINVAL;
++    }
++
+     return OK;
+ }
+ 
+@@ -536,32 +585,21 @@ int board_camera_initialize(void)
+     FAR struct imgsensor_s *sensors[1];
+     int ret;
+ 
+-    syslog(LOG_INFO, "CAM: T1 board_camera_initialize start\n");
+-
+     imgdata = esp32s3_cam_initialize();
+-    syslog(LOG_INFO, "CAM: T2 esp32s3_cam_initialize -> %p\n", imgdata);
+-    if (imgdata == NULL) {
+-        syslog(LOG_ERR, "ERROR: esp32s3_cam_initialize failed\n");
+-        return -ENODEV;
+-    }
+-
+-    ov2640_start_xclk();
+-    syslog(LOG_INFO, "CAM: T3 LEDC XCLK started\n");
+-
+-    imgdata_register(imgdata);
+-    syslog(LOG_INFO, "CAM: T4 imgdata_register done\n");
+-
+-    imgsensor_register(&g_ov2640_sensor);
+-    syslog(LOG_INFO, "CAM: T5 imgsensor_register done\n");
++    up_mdelay(50);
+ 
+     sensors[0] = &g_ov2640_sensor;
+     ret = capture_register("/dev/video0", imgdata, sensors, 1);
+-    syslog(LOG_INFO, "CAM: T6 capture_register -> %d\n", ret);
+     if (ret < 0) {
+-        syslog(LOG_ERR, "ERROR: capture_register failed: %d\n", ret);
+         return ret;
+     }
+ 
+-    syslog(LOG_INFO, "CAM: T7 all done\n");
++    ret = imgsensor_register(&g_ov2640_sensor);
++    if (ret < 0) {
++        capture_unregister("/dev/video0");
++        return ret;
++    }
++
++    imgdata_register(imgdata);
+     return OK;
+ }

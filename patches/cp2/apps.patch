@@ -1,0 +1,13 @@
+diff --git a/examples/camera/camera_main.c b/examples/camera/camera_main.c
+index a5977e714..8c459423c 100644
+--- a/examples/camera/camera_main.c
++++ b/examples/camera/camera_main.c
+@@ -535,7 +535,7 @@ int main(int argc, FAR char *argv[])
+    * And all allocated memorys are VIDIOC_QBUFed.
+    */
+ 
+-  if (capture_num != 0)
++  if (capture_type == V4L2_BUF_TYPE_STILL_CAPTURE && capture_num != 0)
+     {
+       /* Determine image size from connected image sensor name,
+        * because video driver does not support VIDIOC_ENUM_FRAMESIZES
