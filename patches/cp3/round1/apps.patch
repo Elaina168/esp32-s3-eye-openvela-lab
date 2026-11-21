@@ -1,0 +1,40 @@
+diff --git a/examples/camera/Kconfig b/examples/camera/Kconfig
+index 4c29ed0..5e9efe4 100644
+--- a/examples/camera/Kconfig
++++ b/examples/camera/Kconfig
+@@ -27,6 +27,13 @@ config EXAMPLES_CAMERA_STACKSIZE
+ 	int "Camera stack size"
+ 	default 2048
+ 
++config EXAMPLES_CAMERA_VIDEO_BUFFERS
++	int "Number of video capture buffers"
++	default 3
++	range 2 3
++	---help---
++		Number of buffers allocated for the video capture ring.
++
+ config EXAMPLES_CAMERA_OUTPUT_LCD
+ 	bool "Output to LCD"
+ 	default n
+diff --git a/examples/camera/camera_main.c b/examples/camera/camera_main.c
+index 8c45942..498e2c8 100644
+--- a/examples/camera/camera_main.c
++++ b/examples/camera/camera_main.c
+@@ -47,7 +47,7 @@
+ #define IMAGE_JPG_SIZE     (512*1024)  /* 512kB for FullHD Jpeg file. */
+ #define IMAGE_RGB_SIZE     (320*240*2) /* QVGA RGB565 */
+ 
+-#define VIDEO_BUFNUM       (3)
++#define VIDEO_BUFNUM       CONFIG_EXAMPLES_CAMERA_VIDEO_BUFFERS
+ #define STILL_BUFNUM       (1)
+ 
+ #define MAX_CAPTURE_NUM     (100)
+@@ -579,7 +579,7 @@ int main(int argc, FAR char *argv[])
+    * recaptured.
+    *
+    * Allocate freame buffers for QVGA RGB565 size (320x240x2=150KB).
+-   * Number of frame buffers is defined as VIDEO_BUFNUM(3).
++   * 帧缓冲数量由板级配置选择。
+    * And all allocated memorys are VIDIOC_QBUFed.
+    */
+ 

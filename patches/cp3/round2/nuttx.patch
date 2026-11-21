@@ -1,0 +1,334 @@
+diff --git a/arch/xtensa/src/esp32s3/esp32s3_cam.c b/arch/xtensa/src/esp32s3/esp32s3_cam.c
+index ac686c9..00f4296 100644
+--- a/arch/xtensa/src/esp32s3/esp32s3_cam.c
++++ b/arch/xtensa/src/esp32s3/esp32s3_cam.c
+@@ -75,7 +75,9 @@
+ #define ESP32S3_CAM_DMADESC_NUM   56
+ #define ESP32S3_CAM_HALF_BUF_SIZE 15360
+ #define ESP32S3_CAM_DMA_ALIGN    64
+-#define ESP32S3_CAM_DMA_MARGIN   (3 * ESP32S3_CAM_HALF_BUF_SIZE)
++/* 为 EOF 后仍在途的数据保留描述符空间。 */
++
++#define ESP32S3_CAM_DMA_MARGIN   (2 * ESP32S3_CAM_DMA_BUFLEN)
+ #define ESP32S3_CAM_DMA_CAPACITY (ESP32S3_CAM_DMADESC_NUM * \
+                                  ESP32S3_CAM_DMA_BUFLEN)
+ 
+diff --git a/arch/xtensa/src/esp32s3/esp32s3_spi.c b/arch/xtensa/src/esp32s3/esp32s3_spi.c
+index ffb75fe..f3d3e8b 100644
+--- a/arch/xtensa/src/esp32s3/esp32s3_spi.c
++++ b/arch/xtensa/src/esp32s3/esp32s3_spi.c
+@@ -208,7 +208,7 @@ static void esp32s3_spi_exchange(struct spi_dev_s *dev,
+ #ifdef CONFIG_ESP32S3_SPI_DMA
+ static int esp32s3_spi_interrupt(int irq, void *context, void *arg);
+ static int esp32s3_spi_sem_waitdone(struct esp32s3_spi_priv_s *priv);
+-static void esp32s3_spi_dma_exchange(struct esp32s3_spi_priv_s *priv,
++static int esp32s3_spi_dma_exchange(struct esp32s3_spi_priv_s *priv,
+                                      const void *txbuffer,
+                                      void *rxbuffer,
+                                      uint32_t nwords);
+@@ -872,12 +872,12 @@ static int esp32s3_spi_hwfeatures(struct spi_dev_s *dev,
+  *              uint16_t's
+  *
+  * Returned Value:
+- *   None.
++ *   Zero on success or a negated errno from the completion wait.
+  *
+  ****************************************************************************/
+ 
+ #ifdef CONFIG_ESP32S3_SPI_DMA
+-static void esp32s3_spi_dma_exchange(struct esp32s3_spi_priv_s *priv,
++static int esp32s3_spi_dma_exchange(struct esp32s3_spi_priv_s *priv,
+                                      const void *txbuffer,
+                                      void *rxbuffer,
+                                      uint32_t nwords)
+@@ -888,6 +888,7 @@ static void esp32s3_spi_dma_exchange(struct esp32s3_spi_priv_s *priv,
+   uint32_t n;
+   uint8_t *tp;
+   uint8_t *rp;
++  int ret = OK;
+ 
+   DEBUGASSERT((txbuffer != NULL) || (rxbuffer != NULL));
+ 
+@@ -976,14 +977,82 @@ static void esp32s3_spi_dma_exchange(struct esp32s3_spi_priv_s *priv,
+ 
+       esp32s3_spi_set_regbits(SPI_CMD_REG(priv->config->id), SPI_USR_M);
+ 
+-      esp32s3_spi_sem_waitdone(priv);
++      ret = esp32s3_spi_sem_waitdone(priv);
++      if (ret < 0)
++        {
++          spierr("SPI DMA wait failed: %d\n", ret);
++          esp32s3_dma_disable(channel, true);
++          if (rp != NULL)
++            {
++              esp32s3_dma_disable(channel, false);
++            }
++
++          break;
++        }
+ 
+       bytes -= n;
+     }
+ 
+   esp32s3_spi_clr_regbits(SPI_DMA_INT_ENA_REG(priv->config->id),
+                           SPI_TRANS_DONE_INT_ENA_M);
++  return ret;
++}
++
++int esp32s3_spi_send_rgb565_rows(struct spi_dev_s *dev,
++                                 const uint8_t *pixels, size_t row_bytes,
++                                 size_t stride, size_t rows)
++{
++  struct esp32s3_spi_priv_s *priv = (struct esp32s3_spi_priv_s *)dev;
++  size_t used = 0;
++  int ret;
++
++  DEBUGASSERT(priv->nbits == 16 && row_bytes % 2 == 0 &&
++              stride >= row_bytes);
++
++  for (size_t row = 0; row < rows; row++)
++    {
++      const uint8_t *src = pixels + row * stride;
++      size_t remaining = row_bytes;
++
++      while (remaining != 0)
++        {
++          size_t bytes = MIN(remaining, SPI_DMA_TX16_BYTES - used);
++          uint8_t *dst = priv->tx16_wire + used;
++
++          /* 取有效像素时完成线上字节序转换，跳过行尾间隔。 */
++
++          for (size_t i = 0; i < bytes; i += 2)
++            {
++              dst[i] = src[i + 1];
++              dst[i + 1] = src[i];
++            }
++
++          remaining -= bytes;
++          src += bytes;
++          used += bytes;
++          if (used == SPI_DMA_TX16_BYTES)
++            {
++              ret = esp32s3_spi_dma_exchange(priv, priv->tx16_wire,
++                                             NULL, used / 2);
++              if (ret < 0)
++                {
++                  return ret;
++                }
++
++              used = 0;
++            }
++        }
++    }
++
++  if (used != 0)
++    {
++      return esp32s3_spi_dma_exchange(priv, priv->tx16_wire,
++                                      NULL, used / 2);
++    }
++
++  return OK;
+ }
++
+ #endif
+ 
+ /****************************************************************************
+@@ -1249,26 +1318,8 @@ static void esp32s3_spi_exchange(struct spi_dev_s *dev,
+   if ((nwords * priv->nbits) / 8 > thld &&
+       priv->nbits == 16 && txbuffer != NULL && rxbuffer == NULL)
+     {
+-      const uint8_t *pixels = txbuffer;
+-
+-      while (nwords != 0)
+-        {
+-          size_t words = MIN(nwords, SPI_DMA_TX16_BYTES / 2);
+-          size_t bytes = words * 2;
+-
+-          /* 与轮询路径一样，SPI 线上的每个像素先发送高字节。 */
+-
+-          for (size_t i = 0; i < bytes; i += 2)
+-            {
+-              priv->tx16_wire[i] = pixels[i + 1];
+-              priv->tx16_wire[i + 1] = pixels[i];
+-            }
+-
+-          esp32s3_spi_dma_exchange(priv, priv->tx16_wire, NULL, words);
+-          pixels += bytes;
+-          nwords -= words;
+-        }
+-
++      esp32s3_spi_send_rgb565_rows(dev, txbuffer, nwords * 2,
++                                  nwords * 2, 1);
+       return;
+     }
+ 
+diff --git a/arch/xtensa/src/esp32s3/esp32s3_spi.h b/arch/xtensa/src/esp32s3/esp32s3_spi.h
+index 37e7565..027067e 100644
+--- a/arch/xtensa/src/esp32s3/esp32s3_spi.h
++++ b/arch/xtensa/src/esp32s3/esp32s3_spi.h
+@@ -78,6 +78,14 @@ extern "C"
+ 
+ struct spi_dev_s *esp32s3_spibus_initialize(int port);
+ 
++#ifdef CONFIG_ESP32S3_SPI_DMA
++/* 调用方持有 SPI 总线锁并已选择 16 位传输。 */
++
++int esp32s3_spi_send_rgb565_rows(struct spi_dev_s *dev,
++                                 const uint8_t *pixels, size_t row_bytes,
++                                 size_t stride, size_t rows);
++#endif
++
+ /****************************************************************************
+  * Name:  esp32s3_spi[2|3]_select and esp32s3_spi[2|3]_status
+  *
+diff --git a/drivers/lcd/st7789.c b/drivers/lcd/st7789.c
+index e8f6c3e..21186f7 100644
+--- a/drivers/lcd/st7789.c
++++ b/drivers/lcd/st7789.c
+@@ -175,6 +175,9 @@ struct st7789_dev_s
+   /* Private LCD-specific information follows */
+ 
+   FAR struct spi_dev_s *spi;  /* SPI device */
++#ifndef CONFIG_LCD_ST7789_3WIRE
++  st7789_sendrows_t sendrows;
++#endif
+   uint8_t bpp;                /* Selected color depth */
+   uint8_t power;              /* Current power setting */
+ 
+@@ -232,7 +235,7 @@ static void st7789_setarea(FAR struct st7789_dev_s *dev,
+                            uint16_t x0, uint16_t y0,
+                            uint16_t x1, uint16_t y1);
+ static void st7789_bpp(FAR struct st7789_dev_s *dev, int bpp);
+-static void st7789_wrram(FAR struct st7789_dev_s *dev,
++static int st7789_wrram(FAR struct st7789_dev_s *dev,
+                          FAR const uint8_t *buff, size_t size, size_t skip,
+                          size_t count);
+ #ifndef CONFIG_LCD_NOGETRUN
+@@ -610,10 +613,11 @@ static void st7789_bpp(FAR struct st7789_dev_s *dev, int bpp)
+  *
+  ****************************************************************************/
+ 
+-static void st7789_wrram(FAR struct st7789_dev_s *dev,
++static int st7789_wrram(FAR struct st7789_dev_s *dev,
+                          FAR const uint8_t *buff, size_t size, size_t skip,
+                          size_t count)
+ {
++  int ret = OK;
+   size_t i;
+ #ifdef CONFIG_LCD_ST7789_3WIRE
+   size_t j;
+@@ -655,14 +659,22 @@ static void st7789_wrram(FAR struct st7789_dev_s *dev,
+ #else
+   st7789_select(dev->spi, ST7789_BYTESPP * LCD_ST7789_SPI_BITS);
+ 
+-  for (i = 0; i < count; i++)
++  if (dev->sendrows != NULL && skip != 0)
++    {
++      ret = dev->sendrows(dev->spi, buff, size, size + skip, count);
++    }
++  else
+     {
+-      SPI_SNDBLOCK(dev->spi, buff + (i * (size + skip)),
+-                   size / ST7789_BYTESPP);
++      for (i = 0; i < count; i++)
++        {
++          SPI_SNDBLOCK(dev->spi, buff + (i * (size + skip)),
++                       size / ST7789_BYTESPP);
++        }
+     }
+ #endif
+ 
+   st7789_deselect(dev->spi);
++  return ret;
+ }
+ 
+ /****************************************************************************
+@@ -745,9 +757,7 @@ static int st7789_putrun(FAR struct lcd_dev_s *dev,
+   DEBUGASSERT(buffer && ((uintptr_t)buffer & 1) == 0);
+ 
+   st7789_setarea(priv, col, row, col + npixels - 1, row);
+-  st7789_wrram(priv, buffer, npixels * ST7789_BYTESPP, 0, 1);
+-
+-  return OK;
++  return st7789_wrram(priv, buffer, npixels * ST7789_BYTESPP, 0, 1);
+ }
+ 
+ /****************************************************************************
+@@ -797,17 +807,15 @@ static int st7789_putarea(FAR struct lcd_dev_s *dev,
+       /* simpler case, we can just send the whole buffer */
+ 
+       ginfo("Using full screen/full row mode\n");
+-      st7789_wrram(priv, buffer, rows * row_size, 0, 1);
++      return st7789_wrram(priv, buffer, rows * row_size, 0, 1);
+     }
+   else
+     {
+       /* We have to go row by row */
+ 
+       ginfo("Falling-back to row by row mode\n");
+-      st7789_wrram(priv, buffer, row_size, stride - row_size, rows);
++      return st7789_wrram(priv, buffer, row_size, stride - row_size, rows);
+     }
+-
+-  return OK;
+ }
+ 
+ /****************************************************************************
+@@ -975,6 +983,15 @@ static int st7789_setcontrast(FAR struct lcd_dev_s *dev,
+  * Public Functions
+  ****************************************************************************/
+ 
++#ifndef CONFIG_LCD_ST7789_3WIRE
++void st7789_set_sendrows(FAR struct lcd_dev_s *dev,
++                        st7789_sendrows_t sendrows)
++{
++  FAR struct st7789_dev_s *priv = (FAR struct st7789_dev_s *)dev;
++  priv->sendrows = sendrows;
++}
++#endif
++
+ /****************************************************************************
+  * Name:  st7789_initialize
+  *
+diff --git a/include/nuttx/lcd/st7789.h b/include/nuttx/lcd/st7789.h
+index 1df092e..8b0f300 100644
+--- a/include/nuttx/lcd/st7789.h
++++ b/include/nuttx/lcd/st7789.h
+@@ -28,6 +28,8 @@
+  ****************************************************************************/
+ 
+ #include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
+ 
+ /****************************************************************************
+  * Pre-processor Definitions
+@@ -42,6 +44,14 @@
+  * Public Types
+  ****************************************************************************/
+ 
++struct lcd_dev_s;
++struct spi_dev_s;
++
++typedef int (*st7789_sendrows_t)(FAR struct spi_dev_s *spi,
++                                  FAR const uint8_t *buffer,
++                                  size_t row_bytes, size_t stride,
++                                  size_t rows);
++
+ /****************************************************************************
+  * Public Data
+  ****************************************************************************/
+@@ -78,6 +88,13 @@ FAR struct lcd_dev_s *st7789_lcdinitialize(FAR struct spi_dev_s *spi,
+ FAR struct lcd_dev_s *st7789_lcdinitialize(FAR struct spi_dev_s *spi);
+ #endif
+ 
++/* 板级初始化时注册可选的带步长批量传输，回调在 SPI 锁内执行。 */
++
++#ifndef CONFIG_LCD_ST7789_3WIRE
++void st7789_set_sendrows(FAR struct lcd_dev_s *dev,
++                        st7789_sendrows_t sendrows);
++#endif
++
+ #ifdef __cplusplus
+ }
+ #endif

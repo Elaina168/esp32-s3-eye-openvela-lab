@@ -1,0 +1,57 @@
+diff --git a/arch/xtensa/src/esp32s3/esp32s3_spi.c b/arch/xtensa/src/esp32s3/esp32s3_spi.c
+index 4bdb6da..ffb75fe 100644
+--- a/arch/xtensa/src/esp32s3/esp32s3_spi.c
++++ b/arch/xtensa/src/esp32s3/esp32s3_spi.c
+@@ -82,6 +82,10 @@
+ #    define SPI_DMA_DESC_NUM (CONFIG_ESP32S3_SPI_DMA_BUFSIZE / ESP32S3_DMA_BUFLEN_MAX)
+ #  endif
+ 
++/* 用一个对齐的内部缓冲分块发送原生 16 位像素。 */
++
++#define SPI_DMA_TX16_BYTES ESP32S3_DMA_BUFLEN_MAX_4B_ALIGNED
++
+ /* SPI DMA reset before exchange */
+ 
+ #define SPI_DMA_RESET_MASK  (SPI_DMA_AFIFO_RST_M | SPI_RX_AFIFO_RST_M)
+@@ -166,6 +170,8 @@ struct esp32s3_spi_priv_s
+   int cpuint;           /* SPI interrupt ID */
+   int32_t dma_channel;  /* Channel assigned by the GDMA driver */
+ 
++  uint8_t tx16_wire[SPI_DMA_TX16_BYTES] __attribute__((aligned(4)));
++
+   /* DMA RX/TX description */
+ 
+   struct esp32s3_dmadesc_s *dma_rxdesc;
+@@ -1240,6 +1246,32 @@ static void esp32s3_spi_exchange(struct spi_dev_s *dev,
+ #ifdef CONFIG_ESP32S3_SPI_DMA
+   size_t thld = CONFIG_ESP32S3_SPI_DMATHRESHOLD;
+ 
++  if ((nwords * priv->nbits) / 8 > thld &&
++      priv->nbits == 16 && txbuffer != NULL && rxbuffer == NULL)
++    {
++      const uint8_t *pixels = txbuffer;
++
++      while (nwords != 0)
++        {
++          size_t words = MIN(nwords, SPI_DMA_TX16_BYTES / 2);
++          size_t bytes = words * 2;
++
++          /* 与轮询路径一样，SPI 线上的每个像素先发送高字节。 */
++
++          for (size_t i = 0; i < bytes; i += 2)
++            {
++              priv->tx16_wire[i] = pixels[i + 1];
++              priv->tx16_wire[i + 1] = pixels[i];
++            }
++
++          esp32s3_spi_dma_exchange(priv, priv->tx16_wire, NULL, words);
++          pixels += bytes;
++          nwords -= words;
++        }
++
++      return;
++    }
++
+   if ((nwords * priv->nbits) / 8 > thld)
+     {
+       esp32s3_spi_dma_exchange(priv, txbuffer, rxbuffer, nwords);

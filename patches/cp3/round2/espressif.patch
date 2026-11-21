@@ -1,0 +1,15 @@
+diff --git a/boards/esp32s3/esp32s3-eye/src/esp32s3_board_lcd.c b/boards/esp32s3/esp32s3-eye/src/esp32s3_board_lcd.c
+index 89242af..c6492ca 100644
+--- a/boards/esp32s3/esp32s3-eye/src/esp32s3_board_lcd.c
++++ b/boards/esp32s3/esp32s3-eye/src/esp32s3_board_lcd.c
+@@ -100,6 +100,10 @@ int board_lcd_initialize(void)
+       return -ENODEV;
+     }
+ 
++#if defined(CONFIG_ESP32S3_SPI_DMA) && !defined(CONFIG_LCD_ST7789_3WIRE)
++  st7789_set_sendrows(g_lcd, esp32s3_spi_send_rgb565_rows);
++#endif
++
+   return OK;
+ }
+ 
