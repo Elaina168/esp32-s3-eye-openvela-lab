@@ -1,5 +1,5 @@
 diff --git a/arch/xtensa/src/esp32s3/esp32s3_cam.c b/arch/xtensa/src/esp32s3/esp32s3_cam.c
-index 8c4e9feac63..2629a0f43f6 100644
+index 8c4e9feac63..ac686c9ec7c 100644
 --- a/arch/xtensa/src/esp32s3/esp32s3_cam.c
 +++ b/arch/xtensa/src/esp32s3/esp32s3_cam.c
 @@ -35,7 +35,6 @@
@@ -21,22 +21,34 @@ index 8c4e9feac63..2629a0f43f6 100644
  
  /* VSYNC filter threshold */
  
-@@ -88,7 +91,9 @@ struct esp32s3_cam_s
+@@ -84,11 +87,20 @@
+  * Private Types
+  ****************************************************************************/
+ 
++enum esp32s3_cam_frame_state_e
++{
++  ESP32S3_CAM_FRAME_IDLE,
++  ESP32S3_CAM_FRAME_WAIT_VSYNC,
++  ESP32S3_CAM_FRAME_CAPTURING
++};
++
+ struct esp32s3_cam_s
  {
    struct imgdata_s data;
  
+-  bool capturing;
 +  bool streaming;
-   bool capturing;
++  enum esp32s3_cam_frame_state_e frame_state;
 +  bool dma_parked;
  
    int cpuint;
    uint8_t cpu;
-@@ -100,20 +105,13 @@ struct esp32s3_cam_s
+@@ -100,20 +112,12 @@ struct esp32s3_cam_s
    uint8_t *v4l2_buf;              /* V4L2 userptr buffer (no overflow) */
    uint32_t fb_size;               /* Frame size in bytes */
    uint32_t fb_alloc;              /* DMA buffer allocated size */
 -  uint32_t fb_pos;                /* Current write position */
-   uint8_t vsync_cnt;              /* VSYNC counter for frame sync */
+-  uint8_t vsync_cnt;              /* VSYNC counter for frame sync */
 -  uint32_t dma_received;          /* Bytes received by DMA so far */
 -  int dma_desc_offset;            /* Next DMA descriptor index to load */
  
@@ -52,15 +64,16 @@ index 8c4e9feac63..2629a0f43f6 100644
  
    spinlock_t lock;
  };
-@@ -139,6 +137,7 @@ static int esp32s3_cam_start_capture(struct imgdata_s *data,
+@@ -139,6 +143,8 @@ static int esp32s3_cam_start_capture(struct imgdata_s *data,
                                 imgdata_capture_t callback,
                                 void *arg);
  static int esp32s3_cam_stop_capture(struct imgdata_s *data);
 +static void esp32s3_cam_arm_frame(struct esp32s3_cam_s *priv);
++static void esp32s3_cam_begin_frame(struct esp32s3_cam_s *priv);
  
  /****************************************************************************
   * Private Data
-@@ -176,17 +175,17 @@ static void esp32s3_cam_setup_dma(struct esp32s3_cam_s *priv)
+@@ -176,17 +182,17 @@ static void esp32s3_cam_setup_dma(struct esp32s3_cam_s *priv)
    total_desc = (remaining + ESP32S3_CAM_DMA_BUFLEN - 1) /
                 ESP32S3_CAM_DMA_BUFLEN;
  
@@ -82,7 +95,7 @@ index 8c4e9feac63..2629a0f43f6 100644
        priv->dmadesc[i].pbuf = pbuf;
  
        if (i < total_desc - 1)
-@@ -207,20 +206,68 @@ static void frame_complete_worker(void *arg)
+@@ -207,20 +213,85 @@ static void frame_complete_worker(void *arg)
  {
    struct esp32s3_cam_s *priv = (struct esp32s3_cam_s *)arg;
  
@@ -94,6 +107,7 @@ index 8c4e9feac63..2629a0f43f6 100644
 +  uint32_t size;
 +  irqstate_t flags;
 +  bool parked;
++  bool frame_end = false;
 +
 +  flags = spin_lock_irqsave(&priv->lock);
 +  if (!priv->streaming)
@@ -111,9 +125,11 @@ index 8c4e9feac63..2629a0f43f6 100644
 +  parked = priv->dma_parked;
 +  priv->v4l2_buf = NULL;
 +  spin_unlock_irqrestore(&priv->lock, flags);
-+
+ 
+-  if (priv->v4l2_buf != NULL)
 +  if (parked)
-+    {
+     {
+-      memcpy(priv->v4l2_buf, priv->fb, priv->fb_size);
 +      const struct esp32s3_dmadesc_s *desc;
 +
 +      for (desc = priv->dmadesc; desc != NULL; desc = desc->next)
@@ -125,12 +141,29 @@ index 8c4e9feac63..2629a0f43f6 100644
 +              break;
 +            }
 +
-+          received += (ctrl >> ESP32S3_DMA_CTRL_DATALEN_S) &
-+                      ESP32S3_DMA_CTRL_DATALEN_V;
-+        }
-+    }
++          uint32_t length = (ctrl >> ESP32S3_DMA_CTRL_DATALEN_S) &
++                            ESP32S3_DMA_CTRL_DATALEN_V;
++          uint32_t capacity = (ctrl >> ESP32S3_DMA_CTRL_BUFLEN_S) &
++                              ESP32S3_DMA_CTRL_BUFLEN_V;
++          if (length > capacity || length > size - received)
++            {
++              break;
++            }
 +
-+  if (received >= size)
++          received += length;
++
++          /* VSYNC 对应的 EOF 标记才是当前帧的末尾。 */
++
++          if ((ctrl & ESP32S3_DMA_CTRL_EOF) != 0)
++            {
++              frame_end = true;
++              break;
++            }
++        }
+     }
+ 
+-  priv->cb(0, priv->fb_size, &priv->frame_ts, priv->cb_arg);
++  if (frame_end && received == size)
 +    {
 +      up_invalidate_dcache((uintptr_t)priv->fb,
 +                           (uintptr_t)priv->fb + size);
@@ -143,21 +176,18 @@ index 8c4e9feac63..2629a0f43f6 100644
 +    }
 +
 +  /* 回调可能停止流，或用 set_buf 提供下一块缓冲区。 */
- 
--  if (priv->v4l2_buf != NULL)
++
 +  flags = spin_lock_irqsave(&priv->lock);
 +  if (priv->streaming && priv->v4l2_buf != NULL)
-     {
--      memcpy(priv->v4l2_buf, priv->fb, priv->fb_size);
++    {
 +      esp32s3_cam_arm_frame(priv);
-     }
- 
--  priv->cb(0, priv->fb_size, &priv->frame_ts, priv->cb_arg);
++    }
++
 +  spin_unlock_irqrestore(&priv->lock, flags);
  }
  
  /****************************************************************************
-@@ -234,6 +281,7 @@ static void frame_complete_worker(void *arg)
+@@ -234,6 +305,7 @@ static void frame_complete_worker(void *arg)
  static int IRAM_ATTR cam_interrupt(int irq, void *context, void *arg)
  {
    struct esp32s3_cam_s *priv = (struct esp32s3_cam_s *)arg;
@@ -165,10 +195,19 @@ index 8c4e9feac63..2629a0f43f6 100644
    uint32_t status = getreg32(LCD_CAM_LC_DMA_INT_ST_REG);
  
    if (status & LCD_CAM_CAM_VSYNC_INT_ST_M)
-@@ -251,13 +299,7 @@ static int IRAM_ATTR cam_interrupt(int irq, void *context, void *arg)
-            * Second VSYNC = end of frame (buffer is complete).
-            */
+@@ -243,53 +315,44 @@ static int IRAM_ATTR cam_interrupt(int irq, void *context, void *arg)
+       putreg32(LCD_CAM_CAM_VSYNC_INT_CLR_M,
+                LCD_CAM_LC_DMA_INT_CLR_REG);
  
+-      if (priv->capturing)
++      if (priv->frame_state == ESP32S3_CAM_FRAME_WAIT_VSYNC)
+         {
+-          priv->vsync_cnt++;
+-
+-          /* First VSYNC = start of frame (DMA begins filling buffer).
+-           * Second VSYNC = end of frame (buffer is complete).
+-           */
+-
 -          if (priv->vsync_cnt == 1)
 -            {
 -              /* Frame capture just started, DMA is now receiving data.
@@ -176,26 +215,70 @@ index 8c4e9feac63..2629a0f43f6 100644
 -               */
 -            }
 -          else if (priv->vsync_cnt >= 2 && priv->cb)
-+          if (priv->vsync_cnt >= 2)
-             {
-               uint32_t regval;
+-            {
+-              uint32_t regval;
++          esp32s3_cam_begin_frame(priv);
++        }
++      else if (priv->frame_state == ESP32S3_CAM_FRAME_CAPTURING)
++        {
++          uint32_t regval;
  
-@@ -275,12 +317,14 @@ static int IRAM_ATTR cam_interrupt(int irq, void *context, void *arg)
+-              regval = getreg32(LCD_CAM_CAM_CTRL1_REG);
+-              regval &= ~LCD_CAM_CAM_START_M;
+-              putreg32(regval, LCD_CAM_CAM_CTRL1_REG);
++          regval = getreg32(LCD_CAM_CAM_CTRL1_REG);
++          regval &= ~LCD_CAM_CAM_START_M;
++          putreg32(regval, LCD_CAM_CAM_CTRL1_REG);
  
-               /* Bounded wait for DMA to park */
+-              regval = getreg32(LCD_CAM_CAM_CTRL_REG);
+-              regval |= LCD_CAM_CAM_UPDATE_REG_M;
+-              putreg32(regval, LCD_CAM_CAM_CTRL_REG);
++          regval = getreg32(LCD_CAM_CAM_CTRL_REG);
++          regval |= LCD_CAM_CAM_UPDATE_REG_M;
++          putreg32(regval, LCD_CAM_CAM_CTRL_REG);
  
-+              priv->dma_parked = false;
-               for (int tries = 1000; tries > 0; tries--)
+-              SET_GDMA_CH_BITS(DMA_IN_LINK_CH0_REG,
+-                               priv->dma_channel,
+-                               DMA_INLINK_STOP_CH0_M);
++          SET_GDMA_CH_BITS(DMA_IN_LINK_CH0_REG,
++                           priv->dma_channel,
++                           DMA_INLINK_STOP_CH0_M);
+ 
+-              /* Bounded wait for DMA to park */
++          /* Bounded wait for DMA to park */
+ 
+-              for (int tries = 1000; tries > 0; tries--)
++          priv->dma_parked = false;
++          for (int tries = 1000; tries > 0; tries--)
++            {
++              uint32_t regaddr = DMA_IN_LINK_CH0_REG +
++                  priv->dma_channel * GDMA_REG_OFFSET;
++              if (getreg32(regaddr) & DMA_INLINK_PARK_CH0)
                  {
-                   uint32_t regaddr = DMA_IN_LINK_CH0_REG +
-                       priv->dma_channel * GDMA_REG_OFFSET;
-                   if (getreg32(regaddr) & DMA_INLINK_PARK_CH0)
-                     {
-+                      priv->dma_parked = true;
-                       break;
-                     }
+-                  uint32_t regaddr = DMA_IN_LINK_CH0_REG +
+-                      priv->dma_channel * GDMA_REG_OFFSET;
+-                  if (getreg32(regaddr) & DMA_INLINK_PARK_CH0)
+-                    {
+-                      break;
+-                    }
++                  priv->dma_parked = true;
++                  break;
                  }
-@@ -301,6 +345,7 @@ static int IRAM_ATTR cam_interrupt(int irq, void *context, void *arg)
+-
+-              priv->capturing = false;
+-              gettimeofday(&priv->frame_ts, NULL);
+-              work_queue(LPWORK, &priv->frame_work,
+-                         frame_complete_worker, priv, 0);
+             }
++
++          priv->frame_state = ESP32S3_CAM_FRAME_IDLE;
++          gettimeofday(&priv->frame_ts, NULL);
++          work_queue(LPWORK, &priv->frame_work,
++                     frame_complete_worker, priv, 0);
+         }
+     }
+ 
+@@ -301,6 +364,7 @@ static int IRAM_ATTR cam_interrupt(int irq, void *context, void *arg)
                 LCD_CAM_LC_DMA_INT_CLR_REG);
      }
  
@@ -203,12 +286,35 @@ index 8c4e9feac63..2629a0f43f6 100644
    return 0;
  }
  
-@@ -531,15 +576,13 @@ static int esp32s3_cam_init(struct imgdata_s *data)
+@@ -446,10 +510,6 @@ static int esp32s3_cam_config(struct esp32s3_cam_s *priv)
+   /* Configure CAM_CTRL1 after reset:
+    *   - VSYNC filter enable
+    *   - REC_DATA_BYTELEN = DMA node size - 1 (controls in_suc_eof)
+-   *   Note: 8-bit DVP sensor outputs BE RGB565 (high byte first).
+-   *         CAM_BYTE_ORDER only reverses bits within a byte in
+-   *         1-byte mode, so HW byte swap is not available here.
+-   *         Application must swap bytes if LE RGB565 is needed.
+    */
+ 
+   regval = LCD_CAM_CAM_VSYNC_FILTER_EN_M |
+@@ -467,10 +527,6 @@ static int esp32s3_cam_config(struct esp32s3_cam_s *priv)
+ 
+   putreg32(0, LCD_CAM_CAM_RGB_YUV_REG);
+ 
+-  CLR_GDMA_CH_BITS(DMA_IN_CONF0_CH0_REG, priv->dma_channel,
+-                   DMA_INDSCR_BURST_EN_CH0_M |
+-                   DMA_IN_DATA_BURST_EN_CH0_M);
+-
+   if (esp32s3_cam_dmasetup(priv) != OK)
+     {
+       return -ENOMEM;
+@@ -531,15 +587,13 @@ static int esp32s3_cam_init(struct imgdata_s *data)
  {
    struct esp32s3_cam_s *priv = (struct esp32s3_cam_s *)data;
  
+-  priv->capturing = false;
 +  priv->streaming = false;
-   priv->capturing = false;
++  priv->frame_state = ESP32S3_CAM_FRAME_IDLE;
 +  priv->v4l2_buf = NULL;
    priv->cb = NULL;
    priv->cb_arg = NULL;
@@ -221,7 +327,7 @@ index 8c4e9feac63..2629a0f43f6 100644
  
    spin_lock_init(&priv->lock);
  
-@@ -563,15 +606,7 @@ static int esp32s3_cam_init(struct imgdata_s *data)
+@@ -563,15 +617,7 @@ static int esp32s3_cam_init(struct imgdata_s *data)
  static int esp32s3_cam_uninit(struct imgdata_s *data)
  {
    struct esp32s3_cam_s *priv = (struct esp32s3_cam_s *)data;
@@ -238,7 +344,16 @@ index 8c4e9feac63..2629a0f43f6 100644
  
    /* Disable interrupt */
  
-@@ -610,45 +645,58 @@ static int esp32s3_cam_set_buf(struct imgdata_s *data,
+@@ -595,7 +641,7 @@ static int esp32s3_cam_uninit(struct imgdata_s *data)
+       priv->fb = NULL;
+     }
+ 
+-  priv->capturing = false;
++  priv->frame_state = ESP32S3_CAM_FRAME_IDLE;
+ 
+   return OK;
+ }
+@@ -610,45 +656,58 @@ static int esp32s3_cam_set_buf(struct imgdata_s *data,
                                 uint8_t *addr, uint32_t size)
  {
    struct esp32s3_cam_s *priv = (struct esp32s3_cam_s *)data;
@@ -312,7 +427,7 @@ index 8c4e9feac63..2629a0f43f6 100644
    return OK;
  }
  
-@@ -661,21 +709,26 @@ static int esp32s3_cam_validate_frame_setting(struct imgdata_s *data,
+@@ -661,21 +720,26 @@ static int esp32s3_cam_validate_frame_setting(struct imgdata_s *data,
                                 imgdata_format_t *datafmts,
                                 imgdata_interval_t *interval)
  {
@@ -346,7 +461,7 @@ index 8c4e9feac63..2629a0f43f6 100644
    return OK;
  }
  
-@@ -691,26 +744,34 @@ static int esp32s3_cam_start_capture(struct imgdata_s *data,
+@@ -691,33 +755,47 @@ static int esp32s3_cam_start_capture(struct imgdata_s *data,
                                 void *arg)
  {
    struct esp32s3_cam_s *priv = (struct esp32s3_cam_s *)data;
@@ -381,20 +496,36 @@ index 8c4e9feac63..2629a0f43f6 100644
 -  priv->vsync_cnt = 0;
 -  priv->dma_received = 0;
 -  priv->dma_desc_offset = 0;
+-
+-  memset(priv->fb, 0, priv->fb_alloc);
 +  spin_unlock_irqrestore(&priv->lock, flags);
 +  return ret;
 +}
  
--  memset(priv->fb, 0, priv->fb_alloc);
+-  /* Rebuild DMA descriptors (reset OWN bits consumed by prior DMA) */
 +static void esp32s3_cam_arm_frame(struct esp32s3_cam_s *priv)
 +{
-+  uint32_t regval;
++  /* 在线程中准备描述符，只在真实 VSYNC 到达时启动 DMA。 */
+ 
+   esp32s3_cam_setup_dma(priv);
+-
+   up_clean_dcache((uintptr_t)priv->fb,
+                   (uintptr_t)priv->fb + priv->fb_alloc);
++  /* CAM 保持运行才能监听 VSYNC，此时 GDMA 尚未启动。 */
 +
-+  priv->vsync_cnt = 0;
++  modifyreg32(LCD_CAM_CAM_CTRL_REG, 0, LCD_CAM_CAM_UPDATE_REG_M);
++  modifyreg32(LCD_CAM_CAM_CTRL1_REG, 0, LCD_CAM_CAM_START_M);
++  putreg32(LCD_CAM_CAM_VSYNC_INT_CLR_M, LCD_CAM_LC_DMA_INT_CLR_REG);
++  priv->frame_state = ESP32S3_CAM_FRAME_WAIT_VSYNC;
++}
++
++static void esp32s3_cam_begin_frame(struct esp32s3_cam_s *priv)
++{
++  uint32_t regval;
  
-   /* Rebuild DMA descriptors (reset OWN bits consumed by prior DMA) */
+   /* Stop CAM first */
  
-@@ -747,7 +808,9 @@ static int esp32s3_cam_start_capture(struct imgdata_s *data,
+@@ -747,7 +825,9 @@ static int esp32s3_cam_start_capture(struct imgdata_s *data,
    esp32s3_dma_load(priv->dmadesc, priv->dma_channel, false);
    esp32s3_dma_enable(priv->dma_channel, false);
  
@@ -405,21 +536,33 @@ index 8c4e9feac63..2629a0f43f6 100644
  
    regval = getreg32(LCD_CAM_CAM_CTRL_REG);
    regval |= LCD_CAM_CAM_UPDATE_REG_M;
-@@ -764,8 +827,6 @@ static int esp32s3_cam_start_capture(struct imgdata_s *data,
-   up_udelay(10);
+@@ -757,7 +837,7 @@ static int esp32s3_cam_start_capture(struct imgdata_s *data,
+   regval |= LCD_CAM_CAM_START_M;
+   putreg32(regval, LCD_CAM_CAM_CTRL1_REG);
+ 
+-  priv->capturing = true;
++  priv->frame_state = ESP32S3_CAM_FRAME_CAPTURING;
+ 
+   esp32s3_gpio_matrix_in(CONFIG_ESP32S3_CAM_VSYNC_PIN,
+                          CAM_V_SYNC_IDX, false);
+@@ -765,7 +845,9 @@ static int esp32s3_cam_start_capture(struct imgdata_s *data,
    esp32s3_gpio_matrix_in(CONFIG_ESP32S3_CAM_VSYNC_PIN,
                           CAM_V_SYNC_IDX, true);
--
+ 
 -  return OK;
++  /* 由 GPIO 矩阵生成的同步脉冲只用于启动硬件。 */
++
++  putreg32(LCD_CAM_CAM_VSYNC_INT_CLR_M, LCD_CAM_LC_DMA_INT_CLR_REG);
  }
  
  /****************************************************************************
-@@ -775,22 +836,24 @@ static int esp32s3_cam_start_capture(struct imgdata_s *data,
+@@ -775,22 +857,24 @@ static int esp32s3_cam_start_capture(struct imgdata_s *data,
  static int esp32s3_cam_stop_capture(struct imgdata_s *data)
  {
    struct esp32s3_cam_s *priv = (struct esp32s3_cam_s *)data;
 -  uint32_t regval;
--
++  irqstate_t flags = spin_lock_irqsave(&priv->lock);
+ 
 -  regval = getreg32(LCD_CAM_CAM_CTRL1_REG);
 -  regval &= ~LCD_CAM_CAM_START_M;
 -  putreg32(regval, LCD_CAM_CAM_CTRL1_REG);
@@ -427,10 +570,10 @@ index 8c4e9feac63..2629a0f43f6 100644
 -  regval = getreg32(LCD_CAM_CAM_CTRL_REG);
 -  regval |= LCD_CAM_CAM_UPDATE_REG_M;
 -  putreg32(regval, LCD_CAM_CAM_CTRL_REG);
-+  irqstate_t flags = spin_lock_irqsave(&priv->lock);
- 
+-
+-  priv->capturing = false;
 +  priv->streaming = false;
-   priv->capturing = false;
++  priv->frame_state = ESP32S3_CAM_FRAME_IDLE;
 +  modifyreg32(LCD_CAM_CAM_CTRL1_REG, LCD_CAM_CAM_START_M, 0);
 +  modifyreg32(LCD_CAM_CAM_CTRL_REG, 0, LCD_CAM_CAM_UPDATE_REG_M);
 +  esp32s3_dma_disable(priv->dma_channel, false);

@@ -66,6 +66,8 @@ int main(int argc, char **argv)
   unsigned int frames = 0;
   unsigned int changed = 0;
   uint32_t checksum = 0;
+  unsigned int report_at = 30;
+  double elapsed;
   int duration = argc > 1 ? atoi(argv[1]) : 15;
   int cycles = argc > 2 ? atoi(argv[2]) : 100;
   int lcd = -1;
@@ -159,6 +161,8 @@ int main(int argc, char **argv)
   CHECK(ioctl(fd, VIDIOC_STREAMON, (unsigned long)&type) == 0);
   clock_gettime(CLOCK_MONOTONIC, &start);
   now = start;
+  printf("CP2 PREVIEW_START seconds=%d LCD=%ux%u\n",
+         duration, screen.xres, screen.yres);
   do
     {
       uint32_t next = 0;
@@ -186,15 +190,22 @@ int main(int argc, char **argv)
 
       CHECK(ioctl(fd, VIDIOC_QBUF, (unsigned long)&buf) == 0);
       clock_gettime(CLOCK_MONOTONIC, &now);
+      elapsed = now.tv_sec - start.tv_sec +
+                (now.tv_nsec - start.tv_nsec) / 1e9;
+      if (elapsed >= report_at)
+        {
+          printf("CP2 PREVIEW elapsed=%.3fs frames=%u changed=%u\n",
+                 elapsed, frames, changed);
+          report_at += 30;
+        }
     }
-  while (frames < 12 || now.tv_sec - start.tv_sec < duration);
+  while (frames < 12 || elapsed < duration);
 
   CHECK(ioctl(fd, VIDIOC_STREAMOFF, (unsigned long)&type) == 0);
   CHECK(changed > 0);
   printf("CP2 PASS ring frames=%u changed=%u elapsed=%.3fs LCD=%ux%u\n",
          frames, changed,
-         now.tv_sec - start.tv_sec + (now.tv_nsec - start.tv_nsec) / 1e9,
-         screen.xres, screen.yres);
+         elapsed, screen.xres, screen.yres);
   result = 0;
 
 out:
